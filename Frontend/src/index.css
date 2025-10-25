@@ -1,0 +1,107 @@
+@import "tailwindcss";
+/* Tema global del dashboard */
+body {
+  background-color: #F7F9FC;
+  overflow-x: hidden;
+}
+
+/* Animaciones personalizadas */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fadeIn {
+  animation: fadeIn 0.5s ease-out forwards;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.animate-pulse {
+  animation: pulse 1.5s ease-in-out infinite;
+}
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in {
+  animation: fade-in 0.3s ease-out;
+}
+@keyframes scan {
+  0% {
+    transform: translateY(-160px);
+    opacity: 0.3;
+  }
+  50% {
+    transform: translateY(160px);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-160px);
+    opacity: 0.3;
+  }
+}
+
+.animate-scan {
+  animation: scan 2.5s ease-in-out infinite;
+}
+/* ========================================================================= */
+/* ESTILOS TEMPORALES PARA SIMULACIÓN DE EXPORTACIÓN (IMPRESIÓN) */
+/* ========================================================================= */
+
+@media print {
+  /* Oculta todos los elementos no esenciales para la "exportación" */
+  
+  /* Esto oculta todo el contenido excepto la tabla principal. 
+     Ajusta el selector si la tabla no es el único hijo de body.
+     Si `TransactionExplorer` es el componente raíz, tal vez debas
+     usar selectores más específicos, pero en general: */
+
+  body > div.p-6 { /* Ajusta este selector al contenedor principal de la tabla */
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+  
+  /* Oculta los botones superiores (búsqueda, filtros, exportar) */
+  .flex.items-center.gap-3.mb-6:first-child { 
+    display: none !important;
+  }
+  
+  /* Oculta la sección de filtros rápidos */
+  .transition-all.duration-300.overflow-hidden {
+    display: none !important;
+  }
+  
+  /* Oculta el título si no lo quieres en la exportación */
+  .text-3xl.font-extrabold.text-gray-800.mb-6 {
+    display: none !important;
+  }
+  
+  /* Oculta la paginación */
+  .flex.justify-between.items-center.mt-4 {
+    display: none !important;
+  }
+  
+  /* Oculta la columna de "ACCIONES" en la tabla */
+  table th:last-child,
+  table td:last-child {
+    display: none !important;
+  }
+
+  /* Asegura que el contenedor de la tabla sea visible y no tenga sombras */
+  .bg-white.p-6.rounded-lg.shadow-xl {
+    box-shadow: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  /* Opcional: Asegura que el fondo sea blanco */
+  body,
+  html,
+  .p-6.bg-gray-50.min-h-screen {
+    background: white !important;
+    min-height: auto !important;
+  }
+}
