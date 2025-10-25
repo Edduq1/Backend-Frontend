@@ -1,15 +1,27 @@
-"""
-URLs para la aplicación de login facial.
-"""
-
 from django.urls import path
-from . import views
-
-app_name = 'login_facial'
+from rest_framework_simplejwt.views import TokenBlacklistView
+from .views import (
+    MultiStageLoginView,
+    UserDataView,
+    UserRegistrationView,
+    FacialRegistrationView
+)
 
 urlpatterns = [
-    path('registrar/', views.registrar_codificacion, name='registrar_codificacion'),
-    path('verificar/', views.verificar_login_facial, name='verificar_login_facial'),
-    path('intentos/', views.listar_intentos, name='listar_intentos'),
-    path('bloqueos/', views.listar_ips_bloqueadas, name='listar_ips_bloqueadas'),
+    # --- Autenticación (Login) ---
+    # POST /api/v1/auth/login
+    path('auth/login', MultiStageLoginView.as_view(), name='api_login'),
+    
+    # GET /api/v1/auth/me
+    path('auth/me', UserDataView.as_view(), name='api_me'),
+    
+    # POST /api/v1/auth/logout
+    path('auth/logout', TokenBlacklistView.as_view(), name='api_logout'),
+
+    # --- Registro de Usuarios ---
+    # POST /api/v1/users
+    path('users', UserRegistrationView.as_view(), name='api_register_user'),
+    
+    # POST /api/v1/users/<user_id>/facial-register
+    path('users/<str:user_id>/facial-register', FacialRegistrationView.as_view(), name='api_facial_register'),
 ]

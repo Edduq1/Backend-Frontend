@@ -1,322 +1,379 @@
-"""
-Vistas para la aplicación de login facial.
-"""
-
-import time
+import logging
+import base64
+import json
 import uuid
-from datetime import timedelta
-from typing import Dict, Any
+from typing import Optional, Dict, Any
 
-from django.utils import timezone
-from django.contrib.auth.models import User
-from django.db.models import Q
-from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
+# Imports de Django REST Framework y JWT
+from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import (
-    FaceEncoding,
-    FaceLoginAttempt,
-    FaceRecognitionSettings,
-    BlockedIP,
-)
+# Imports locales
+from .models import Usuario
+from BD.operaciones import SupabaseOperations
+from django.utils import timezone
 
+# Imports para la lógica facial
+try:
+    import numpy as np
+    import cv2
+except ImportError:
+    np = None
+    cv2 = None
+try:
+    import face_recognition
+except ImportError:
+    face_recognition = None
 
-def _get_client_ip(request) -> str:
-    ip = request.META.get('HTTP_X_FORWARDED_FOR')
-    if ip:
-        ip = ip.split(',')[0].strip()
-    else:
-        ip = request.META.get('REMOTE_ADDR', '0.0.0.0')
-    return ip
+log = logging.getLogger('facial')
 
-
-def _get_active_settings() -> FaceRecognitionSettings:
-    settings_qs = FaceRecognitionSettings.objects.filter(is_active=True)
-    if settings_qs.exists():
-        return settings_qs.first()
-    # Fallback de configuración por defecto si no hay registros
-    return FaceRecognitionSettings(
-        name='default',
-        algorithm='face_recognition',
-        confidence_threshold=0.6,
-        max_face_distance=0.6,
-        min_face_size=50,
-        max_image_size=1024,
-        quality_threshold=0.5,
-        max_attempts_per_minute=5,
-        max_failed_attempts=3,
-        block_duration_minutes=15,
-        enable_liveness_detection=False,
-        is_active=True,
-    )
-
-
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def registrar_codificacion(request):
-    """
-    Registra una codificación facial para un usuario.
-    
-    Body JSON esperado:
-    {
-        "user_id": "<uuid>", // opcional si se envía "username"
-        "username": "<str>", // opcional si se envía "user_id"
-        "encoding_data": { ... },
-        "is_primary": false,
-        "confidence_score": 0.92,
-        "image_quality_score": 0.88
-    }
-    """
+def _compute_embedding_from_b64(b64_str) -> Optional['np.ndarray']:
+    log = logging.getLogger('facial')
+    if not b64_str:
+        log.debug('compute_embedding: b64_str vacío')
+        return None
+    if np is None:
+        log.debug('compute_embedding: numpy no disponible')
+        return None
     try:
-        user_id = request.data.get('user_id')
-        username = request.data.get('username')
-        encoding_data = request.data.get('encoding_data')
-        is_primary = bool(request.data.get('is_primary', False))
-        confidence_score = float(request.data.get('confidence_score', 0.0))
-        image_quality_score = float(request.data.get('image_quality_score', 0.0))
-        
-        if not encoding_data:
-            return Response({
-                'success': False,
-                'error': 'El campo "encoding_data" es requerido'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Resolver usuario
-        user = None
-        if user_id:
-            try:
-                user = User.objects.get(id=user_id)
-            except User.DoesNotExist:
-                return Response({'success': False, 'error': 'Usuario no encontrado'}, status=status.HTTP_404_NOT_FOUND)
-        elif username:
-            try:
-                user = User.objects.get(username=username)
-            except User.DoesNotExist:
-                return Response({'success': False, 'error': 'Usuario no encontrado'}, status=status.HTTP_404_NOT_FOUND)
+        header, encoded = b64_str.split(',') if ',' in b64_str else ('', b64_str)
+        img_bytes = base64.b64decode(encoded)
+        image = np.frombuffer(img_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(image, cv2.IMREAD_COLOR)
+        if frame is None:
+            log.debug('compute_embedding: cv2.imdecode devolvió None')
+            return None
+        if face_recognition is not None:
+            rgb = frame[:, :, ::-1]
+            boxes = face_recognition.face_locations(rgb, model='hog')
+            log.debug(f'compute_embedding: boxes={len(boxes)}')
+            if not boxes:
+                return None
+            encs = face_recognition.face_encodings(rgb, boxes)
+            log.debug(f'compute_embedding: encs={len(encs)}')
+            if not encs:
+                return None
+            return np.array(encs[0], dtype=np.float32)
         else:
-            return Response({'success': False, 'error': 'Debe proporcionar "user_id" o "username"'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Crear codificación
-        fe = FaceEncoding.objects.create(
-            user=user,
-            encoding_data=encoding_data,
-            is_primary=is_primary,
-            confidence_score=confidence_score,
-            image_quality_score=image_quality_score,
-        )
-        
-        # Si no había primaria, establecer esta como primaria
-        if not FaceEncoding.objects.filter(user=user, is_primary=True).exclude(id=fe.id).exists():
-            fe.is_primary = True
-            fe.save(update_fields=['is_primary'])
-        
-        return Response({
-            'success': True,
-            'encoding_id': str(fe.id),
-            'user': user.username,
-            'is_primary': fe.is_primary
-        }, status=status.HTTP_201_CREATED)
+            # Fallback: usar promedio de píxeles de la región central como "huella" rudimentaria
+            h, w = frame.shape[:2]
+            cx, cy = w // 2, h // 2
+            crop = frame[max(cy-100,0):cy+100, max(cx-100,0):cx+100]
+            if crop.size == 0:
+                log.debug('compute_embedding: crop vacío en fallback')
+                return None
+            emb = cv2.resize(crop, (16, 16)).astype('float32').reshape(-1)
+            emb = emb / (np.linalg.norm(emb) + 1e-6)
+            return emb
     except Exception as e:
-        return Response({'success': False, 'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        logging.getLogger('facial').exception(f'compute_embedding: excepción {e}')
+        return None
 
 
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def verificar_login_facial(request):
-    """
-    Verifica un intento de login facial comparando una codificación enviada
-    contra las codificaciones registradas. Esta implementación es simplificada.
-    
-    Body JSON esperado:
-    {
-        "encoding_data": { ... },
-        "username": "opcional",
-        "session_id": "opcional",
-        "image_metadata": { ... opcional ... }
-    }
-    """
-    start_time = time.time()
-    client_ip = _get_client_ip(request)
-    settings_obj = _get_active_settings()
-    now = timezone.now()
-    
-    # Rate limiting por IP
+def _compare_embeddings(stored_bytes: bytes, live_emb) -> bool:
+    if stored_bytes is None or live_emb is None or np is None:
+        return False
     try:
-        existing_block = BlockedIP.objects.filter(ip_address=client_ip).first()
-        if existing_block and existing_block.is_currently_blocked():
-            attempt = FaceLoginAttempt.objects.create(
-                user=None,
-                ip_address=client_ip,
-                user_agent=request.META.get('HTTP_USER_AGENT', ''),
-                status='blocked',
-                failure_reason='too_many_attempts',
-                image_metadata=request.data.get('image_metadata'),
-                detection_details={'reason': 'ip_blocked'},
-                session_id=request.data.get('session_id')
-            )
-            return Response({
-                'success': False,
-                'blocked': True,
-                'blocked_until': existing_block.blocked_until.isoformat(),
-                'reason': existing_block.reason
-            }, status=status.HTTP_429_TOO_MANY_REQUESTS)
-        
-        one_minute_ago = now - timedelta(minutes=1)
-        recent_attempts = FaceLoginAttempt.objects.filter(
-            ip_address=client_ip,
-            created_at__gte=one_minute_ago
-        ).count()
-        
-        if recent_attempts >= settings_obj.max_attempts_per_minute:
-            BlockedIP.objects.create(
-                ip_address=client_ip,
-                reason='too_many_attempts',
-                failed_attempts_count=recent_attempts,
-                blocked_until=now + timedelta(minutes=settings_obj.block_duration_minutes),
-                notes='Bloqueo automático por demasiados intentos',
-                is_permanent=False,
-                created_by=None
-            )
-            attempt = FaceLoginAttempt.objects.create(
-                user=None,
-                ip_address=client_ip,
-                user_agent=request.META.get('HTTP_USER_AGENT', ''),
-                status='blocked',
-                failure_reason='too_many_attempts',
-                image_metadata=request.data.get('image_metadata'),
-                detection_details={'reason': 'rate_limit_exceeded'},
-                session_id=request.data.get('session_id')
-            )
-            return Response({
-                'success': False,
-                'blocked': True,
-                'blocked_until': (now + timedelta(minutes=settings_obj.block_duration_minutes)).isoformat(),
-                'reason': 'too_many_attempts'
-            }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        stored = np.frombuffer(stored_bytes, dtype=np.float32)
+        if face_recognition is not None and stored.shape[0] in (128, 129):
+            # distancia euclidiana típica < 0.6
+            dist = np.linalg.norm(stored[:128] - live_emb[:128])
+            return dist < 0.6
+        else:
+            # coseno para el fallback
+            num = float(np.dot(stored, live_emb))
+            den = (np.linalg.norm(stored) * np.linalg.norm(live_emb) + 1e-6)
+            sim = num / den
+            return sim > 0.9
     except Exception:
-        pass
-    
+        return False
+
+
+def _compare_to_collection(user: Usuario, live_emb) -> bool:
+    """Compara el embedding vivo contra la colección de embeddings del usuario.
+    Mantiene la lógica: si no hay colección, usa el método de compatibilidad _compare_embeddings.
+    Usa umbral estricto base 0.45 con leve adaptación hasta 0.55 por intentos fallidos.
+    """
     try:
-        encoding_data = request.data.get('encoding_data')
-        username = request.data.get('username')
-        session_id = request.data.get('session_id')
-        image_metadata = request.data.get('image_metadata')
-        
-        if not encoding_data:
-            return Response({'success': False, 'error': 'encoding_data requerido'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Buscar codificaciones candidatas
-        encodings_qs = FaceEncoding.objects.filter(is_active=True)
-        if username:
-            encodings_qs = encodings_qs.filter(user__username=username)
-        
-        matched_user = None
-        confidence = 0.0
-        detection_details = {
-            'algorithm': settings_obj.algorithm,
-            'comparisons': 0,
+        if live_emb is None:
+            return False
+        if np is None:
+            # Sin numpy no podemos comparar colecciones; usar compatibilidad
+            return _compare_embeddings(user.facial_data, live_emb)
+        # Si no hay colección, caer al camino de compatibilidad
+        if not user.facial_embeddings:
+            return _compare_embeddings(user.facial_data, live_emb)
+
+        base_thr = 0.45
+        thr = min(base_thr + (user.failed_attempts or 0) * 0.03, 0.55)
+
+        live = np.array(live_emb, dtype=np.float32)
+        for emb_list in user.facial_embeddings:
+            stored = np.array(emb_list, dtype=np.float32)
+            # Euclidiana en primeras 128 dims (face_recognition)
+            dist = float(np.linalg.norm(stored[:128] - live[:128]))
+            if dist < thr:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _validate_position_collection(user: Usuario, live_pos) -> bool:
+    """Valida la posición contra alguna de las posiciones registradas en el usuario.
+    Si no hay colección, usa la posición de compatibilidad existente.
+    Tolerancias estrictas y ligera adaptación por intentos fallidos.
+    """
+    try:
+        if not live_pos:
+            return False
+        positions = user.positions or ([] if user.position_data is None else [user.position_data])
+        if not positions:
+            return False
+
+        # Tolerancias base
+        attempts = user.failed_attempts or 0
+        tol_xy = max(0.05, 0.10 - attempts * 0.01)      # 0.10 -> 0.05
+        tol_scale = max(0.08, 0.15 - attempts * 0.01)   # 0.15 -> 0.08
+
+        for p in positions:
+            # Formato {x,y,scale}
+            if all(k in p for k in ('x', 'y', 'scale')) and all(k in live_pos for k in ('x', 'y', 'scale')):
+                if (
+                    abs(p['x'] - live_pos['x']) <= tol_xy and
+                    abs(p['y'] - live_pos['y']) <= tol_xy and
+                    abs(p['scale'] - live_pos['scale']) <= tol_scale
+                ):
+                    return True
+            # Formato angular {roll,pitch,yaw,dist}
+            if all(k in p for k in ('roll', 'pitch', 'yaw', 'dist')) and all(k in live_pos for k in ('roll', 'pitch', 'yaw', 'dist')):
+                tol_ang = max(8, 15 - attempts * 1)
+                tol_dist = max(0.12, 0.22 - attempts * 0.02)
+                if (
+                    abs(p['roll'] - live_pos['roll']) <= tol_ang and
+                    abs(p['pitch'] - live_pos['pitch']) <= tol_ang and
+                    abs(p['yaw'] - live_pos['yaw']) <= tol_ang and
+                    abs(p['dist'] - live_pos['dist']) <= tol_dist
+                ):
+                    return True
+        return False
+    except Exception:
+        return False
+
+def _validate_position(stored_pos, live_pos) -> bool:
+    try:
+        # posición esperada: dict con {x,y,scale} o {roll,pitch,yaw,dist}
+        keys = ('x', 'y', 'scale')
+        if all(k in stored_pos for k in keys) and all(k in live_pos for k in keys):
+            tol_xy = 0.12
+            tol_scale = 0.20
+            ok = (
+                abs(stored_pos['x'] - live_pos['x']) <= tol_xy and
+                abs(stored_pos['y'] - live_pos['y']) <= tol_xy and
+                abs(stored_pos['scale'] - live_pos['scale']) <= tol_scale
+            )
+            return ok
+        angles = ('roll', 'pitch', 'yaw', 'dist')
+        if all(k in stored_pos for k in angles) and all(k in live_pos for k in angles):
+            tol_ang = 15  # grados
+            tol_dist = 0.25
+            return (
+                abs(stored_pos['roll'] - live_pos['roll']) <= tol_ang and
+                abs(stored_pos['pitch'] - live_pos['pitch']) <= tol_ang and
+                abs(stored_pos['yaw'] - live_pos['yaw']) <= tol_ang and
+                abs(stored_pos['dist'] - live_pos['dist']) <= tol_dist
+            )
+        return False
+    except Exception:
+        return False
+
+# --- VISTAS DE API ADAPTADAS ---
+
+class MultiStageLoginView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        data = request.data
+        # Instancia del conector Supabase DENTRO de la vista
+        db = SupabaseOperations(admin=True) 
+
+        # --- Etapa 1: Username (DNI o Email) ---
+        if 'username' in data and 'password' in data: # Ignoramos password
+            username = data['username']
+
+            # --- Usa SupabaseOperations ---
+            user_data = None
+            filters_dni = {'dni': username}
+            resp_dni = db.select_with_filter(table='REGISTRO_USUARIOS', filters=filters_dni)
+            if resp_dni.get('success') and resp_dni.get('data'):
+                user_data = resp_dni['data'][0]
+            else:
+                filters_email = {'email': username}
+                resp_email = db.select_with_filter(table='REGISTRO_USUARIOS', filters=filters_email)
+                if resp_email.get('success') and resp_email.get('data'):
+                    user_data = resp_email['data'][0]
+            # --- Fin Uso SupabaseOperations ---
+
+            if user_data and user_data.get('estado') == 'Activo':
+                request.session['login_user_id'] = user_data['id'] # ID de Supabase
+                return Response({"status": "pending_facial_recognition"})
+
+            return Response({"error": "Credenciales inválidas o usuario inactivo"}, status=400)
+
+        # --- Etapa 2: Reconocimiento Facial ---
+        elif 'facialToken' in data:
+            user_id = request.session.get('login_user_id')
+            if not user_id: return Response({"error": "Flujo de login inválido"}, status=400)
+
+            # --- Usa SupabaseOperations ---
+            resp = db.select_with_filter(table='REGISTRO_USUARIOS', filters={'id': user_id})
+            if not resp.get('success') or not resp.get('data'):
+                return Response({"error": "Usuario no encontrado"}, status=404)
+            user_data = resp['data'][0]
+            # --- Fin Uso SupabaseOperations ---
+
+            # Objeto temporal para lógica pura
+            temp_user_obj = Usuario(**user_data) 
+
+            live_emb = _compute_embedding_from_b64(data['facialToken']) # Tu lógica pura
+            if live_emb is None: return Response({"error": "Rostro no detectado"}, status=401)
+
+            match = _compare_to_collection(temp_user_obj, live_emb) # Tu lógica pura
+            position_ok = _validate_position_collection(temp_user_obj, data.get('position_data', {})) # Tu lógica pura
+
+            if match and position_ok:
+                # --- Usa SupabaseOperations ---
+                db.update_record(table='REGISTRO_USUARIOS', record_id=user_id, data={'failed_attempts': 0})
+                # --- Fin Uso SupabaseOperations ---
+                return Response({"status": "pending_dni_code"})
+
+            new_attempts = min(user_data.get('failed_attempts', 0) + 1, 5)
+            # --- Usa SupabaseOperations ---
+            db.update_record(table='REGISTRO_USUARIOS', record_id=user_id, data={'failed_attempts': new_attempts})
+            # --- Fin Uso SupabaseOperations ---
+            return Response({"error": "Reconocimiento facial fallido"}, status=401)
+
+        # --- Etapa 3 y 4: DNI y Código Manual ---
+        elif 'dni' in data and 'code' in data:
+            user_id = request.session.get('login_user_id')
+            if not user_id: return Response({"error": "Flujo de login inválido"}, status=400)
+
+            # --- Usa SupabaseOperations ---
+            resp = db.select_with_filter(table='REGISTRO_USUARIOS', filters={'id': user_id})
+            if not resp.get('success') or not resp.get('data'):
+                return Response({"error": "Usuario no encontrado"}, status=404)
+            user_data = resp['data'][0]
+            # --- Fin Uso SupabaseOperations ---
+
+            dni_valido = (user_data.get('dni') == data['dni'])
+            codigo_valido = (data['code'] == "CODIGO_SECRETO") # <-- Lógica real por definir
+
+            if dni_valido and codigo_valido:
+                request.session.flush()
+                user_obj_for_token = Usuario(id=user_data['id'], dni=user_data['dni'], email=user_data.get('email'))
+                refresh = RefreshToken.for_user(user_obj_for_token)
+
+                return Response({
+                    'token': str(refresh.access_token),
+                    'user': { # Datos de Supabase
+                        'id': user_data['id'],
+                        'nombre': f"{user_data.get('nombres')} {user_data.get('apellidos')}",
+                        'rol': user_data.get('rol')
+                    }
+                })
+
+            return Response({"error": "DNI o código manual inválido"}, status=401)
+
+        return Response({"error": "Payload de login incorrecto"}, status=400)
+
+class UserDataView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        user_id = request.user.id # ID del token JWT
+        db = SupabaseOperations(admin=True)
+
+        # --- Usa SupabaseOperations ---
+        resp = db.select_with_filter(table='REGISTRO_USUARIOS', filters={'id': user_id})
+        if not resp.get('success') or not resp.get('data'):
+            return Response({"error": "Usuario no encontrado"}, status=404)
+        user_data = resp['data'][0]
+        # --- Fin Uso SupabaseOperations ---
+
+        return Response({ # Datos de Supabase
+            'id': user_data['id'],
+            'nombre': f"{user_data.get('nombres')} {user_data.get('apellidos')}",
+            'rol': user_data.get('rol')
+        })
+
+# --- Vistas de Registro (Adaptadas para Supabase) ---
+class UserRegistrationView(APIView):
+    permission_classes = [AllowAny] 
+
+    def post(self, request, *args, **kwargs):
+        data = request.data
+        db = SupabaseOperations(admin=True)
+        # ... (Validación de datos como antes) ...
+        required_fields = ['dni', 'nombres', 'apellidos', 'email', 'rol']
+        if not all(field in data for field in required_fields):
+            return Response({"error": "Faltan campos requeridos"}, status=400)
+
+        new_user_id = f'u-{uuid.uuid4().hex[:6]}'
+        user_to_insert = { # Mapeo a tabla REGISTRO_USUARIOS
+            'id': new_user_id,
+            'dni': data['dni'],
+            'nombres': data['nombres'],
+            'apellidos': data['apellidos'],
+            'email': data['email'],
+            'rol': data['rol'],
+            'estado': 'Activo',
+            'face_registered': False,
+            # Campos faciales iniciales vacíos
+            'facial_embeddings': [], 
+            'positions': [],
+            'failed_attempts': 0
         }
-        
-        # Implementación de coincidencia simplificada: si hay coincidencia exacta de una clave
-        # conocida en el JSON de encoding, considerar éxito.
-        # En producción se calcularía distancia euclidiana/coseno, etc.
-        key = 'signature'
-        provided_signature = encoding_data.get(key)
-        for fe in encodings_qs:
-            detection_details['comparisons'] += 1
-            stored_signature = (fe.encoding_data or {}).get(key)
-            if stored_signature and provided_signature and stored_signature == provided_signature:
-                matched_user = fe.user
-                confidence = max(confidence, fe.confidence_score or 0.9)
-                break
-        
-        status_value = 'success' if matched_user else 'failed'
-        failure_reason = None if matched_user else 'no_match'
-        processing_time = time.time() - start_time
-        
-        attempt = FaceLoginAttempt.objects.create(
-            user=matched_user,
-            ip_address=client_ip,
-            user_agent=request.META.get('HTTP_USER_AGENT', ''),
-            status=status_value,
-            confidence_score=confidence if matched_user else None,
-            processing_time=processing_time,
-            failure_reason=failure_reason,
-            image_metadata=image_metadata,
-            detection_details=detection_details,
-            session_id=session_id
-        )
-        
-        return Response({
-            'success': True if matched_user else False,
-            'status': status_value,
-            'username': matched_user.username if matched_user else None,
-            'confidence_score': confidence if matched_user else None,
-            'attempt_id': str(attempt.id),
-            'processing_time': processing_time,
-        }, status=status.HTTP_200_OK if matched_user else status.HTTP_401_UNAUTHORIZED)
-    except Exception as e:
-        return Response({'success': False, 'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+        try:
+            # --- Usa SupabaseOperations ---
+            result = db.insert_record(table='REGISTRO_USUARIOS', data=user_to_insert)
+            # --- Fin Uso SupabaseOperations ---
+            if result.get('success'):
+                return Response({"message": "Usuario registrado", "user_id": new_user_id}, status=201)
+            else:
+                return Response({"error": result.get('error', 'Error al registrar')}, status=500)
+        except Exception as e:
+            return Response({"error": str(e)}, status=400)
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def listar_intentos(request):
-    """
-    Lista intentos de login facial con filtros simples.
-    Query params: username, status, limit (por defecto 50)
-    """
-    try:
-        username = request.GET.get('username')
-        status_filter = request.GET.get('status')
-        limit = int(request.GET.get('limit', 50))
-        
-        qs = FaceLoginAttempt.objects.all().order_by('-created_at')
-        if username:
-            qs = qs.filter(user__username=username)
-        if status_filter:
-            qs = qs.filter(status=status_filter)
-        
-        attempts = []
-        for a in qs[:limit]:
-            attempts.append({
-                'id': str(a.id),
-                'username': a.user.username if a.user else None,
-                'ip_address': a.ip_address,
-                'status': a.status,
-                'confidence_score': a.confidence_score,
-                'processing_time': a.processing_time,
-                'failure_reason': a.failure_reason,
-                'created_at': a.created_at.isoformat(),
-            })
-        
-        return Response({'success': True, 'attempts': attempts, 'count': len(attempts)}, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({'success': False, 'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+class FacialRegistrationView(APIView):
+    permission_classes = [IsAuthenticated] 
 
+    def post(self, request, user_id, *args, **kwargs):
+        db = SupabaseOperations(admin=True)
+        # ... (Validación de datos y permisos como antes) ...
+        if request.user.id != user_id:
+            return Response({"error": "No autorizado"}, status=403)
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def listar_ips_bloqueadas(request):
-    """
-    Lista IPs bloqueadas actualmente.
-    """
-    try:
-        now = timezone.now()
-        qs = BlockedIP.objects.all()
-        items = []
-        for b in qs:
-            items.append({
-                'ip_address': b.ip_address,
-                'reason': b.reason,
-                'failed_attempts_count': b.failed_attempts_count,
-                'blocked_until': b.blocked_until.isoformat(),
-                'currently_blocked': b.is_currently_blocked(),
-                'notes': b.notes,
-                'is_permanent': b.is_permanent,
-            })
-        return Response({'success': True, 'blocked_ips': items, 'count': len(items)}, status=status.HTTP_200_OK)
-    except Exception as e:
-        return Response({'success': False, 'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        embeddings_data = request.data.get('embeddings')
+        positions_data = request.data.get('positions')
+        if not embeddings_data or not positions_data:
+            return Response({"error": "Faltan datos faciales"}, status=400)
+
+        data_to_update = { # Mapeo a tabla REGISTRO_USUARIOS
+            'facial_embeddings': embeddings_data,
+            'positions': positions_data,
+            'face_registered': True 
+        }
+
+        try:
+            # --- Usa SupabaseOperations ---
+            result = db.update_record(table='REGISTRO_USUARIOS', record_id=user_id, data=data_to_update)
+            # --- Fin Uso SupabaseOperations ---
+            if result.get('success'):
+                return Response({"message": "Registro facial completado"}, status=200)
+            else:
+                return Response({"error": result.get('error', 'Error al guardar datos')}, status=500)
+        except Exception as e:
+            return Response({"error": str(e)}, status=400)

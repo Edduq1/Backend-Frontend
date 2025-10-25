@@ -24,7 +24,7 @@ urlpatterns = [
     # URLs de las aplicaciones
     path('datos/', include('datos.urls')),
     path('fraude/', include('fraude.urls')),
-    path('login-facial/', include('login_facial.urls')),
+    path('api/v1/', include('login_facial.urls')),
     path('productos/', include('productos.urls')),
     path('pago/', include('pago.urls')),
 ]

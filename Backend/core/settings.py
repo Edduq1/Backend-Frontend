@@ -178,3 +178,14 @@ CORS_ALLOW_ALL_ORIGINS = True  # Solo para desarrollo
 # Configuración de archivos de medios
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+auth_user_model = 'login_facial.Usuario'
+
+rest_framework = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
+    ),
+}
